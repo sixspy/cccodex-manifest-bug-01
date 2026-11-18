@@ -1,11 +1,6 @@
 from app.db import get_db
-
-
-class ServiceError(Exception):
-    def __init__(self, message: str, status_code: int = 400):
-        super().__init__(message)
-        self.message = message
-        self.status_code = status_code
+from app.services.errors import ServiceError
+from app.services.rails import current_rail_in
 
 
 def list_objects(batch_id: int, db_path: str | None = None) -> list[dict]:
@@ -31,6 +26,13 @@ def register_object(
     if byte_size < 0:
         raise ServiceError("字节数不能为负")
     with get_db(db_path) as conn:
+        # 灌库门槛只认唯一现行轨，与展示面同源，同事务读取
+        rail = current_rail_in(conn)
+        if byte_size < rail["min_byte_size"]:
+            raise ServiceError(
+                f"未过门槛：现行轨 {rail['rail_code']}（{rail['rule_version']}）"
+                f"要求字节数 ≥ {rail['min_byte_size']}"
+            )
         batch = conn.execute(
             "SELECT * FROM landing_batches WHERE id=?", (batch_id,)
         ).fetchone()

@@ -10,16 +10,19 @@ from litestar.status_codes import HTTP_302_FOUND
 from app.config import Config
 from app.db import init_db
 from app.services import (
+    ServiceError,
     close_batch,
     get_batch,
+    get_current_rail,
     list_batches,
+    list_close_runs,
     list_objects,
+    list_rails,
     list_reports,
     register_object,
     run_visibility,
+    switch_rail,
 )
-from app.services.batches import get_current_rail
-from app.services.objects import ServiceError
 
 ROOT = Path(__file__).resolve().parent.parent
 STATIC = ROOT / "static"
@@ -42,6 +45,15 @@ def require_user(request: Request) -> str:
     if user != Config.ADMIN_USER:
         raise HTTPException(status_code=401, detail="未登录")
     return user
+
+
+def service_error_handler(_: Request, exc: ServiceError) -> Response:
+    # 白话短句统一出口：业务失败都带 ok=False + error
+    return Response(
+        content={"ok": False, "error": exc.message},
+        status_code=exc.status_code,
+        media_type="application/json",
+    )
 
 
 def _on_startup() -> None:
@@ -108,19 +120,36 @@ async def api_logout() -> Response:
 @get("/api/meta")
 async def api_meta(request: Request) -> dict:
     require_user(request)
-    rail = get_current_rail()
     return {
         "lab_name": Config.LAB_NAME,
         "product_line": "cc-manifest-lab",
         "chain": ["落地批次", "对象登记", "清单闭合", "可见性对账"],
-        "rail": rail,
+        "rail": get_current_rail(),
     }
+
+
+@get("/api/rails")
+async def api_rails(request: Request) -> dict:
+    require_user(request)
+    return list_rails()
+
+
+@post("/api/rails/switch")
+async def api_switch_rail(request: Request) -> Response:
+    user = require_user(request)
+    body = await request.json()
+    rail = switch_rail(str(body.get("to_rail", "")), operator=user)
+    return Response(
+        content={"ok": True, "rail": rail},
+        status_code=200,
+        media_type="application/json",
+    )
 
 
 @get("/api/batches")
 async def api_batches(request: Request, status: str | None = None) -> dict:
     require_user(request)
-    return {"items": list_batches(status=status)}
+    return {"items": list_batches(status=status), "rail": get_current_rail()}
 
 
 @get("/api/batches/{batch_id:int}")
@@ -129,26 +158,23 @@ async def api_batch_detail(request: Request, batch_id: int) -> dict:
     batch = get_batch(batch_id)
     if not batch:
         raise HTTPException(status_code=404, detail="批次不存在")
-    return {"batch": batch, "objects": list_objects(batch_id)}
+    return {
+        "batch": batch,
+        "objects": list_objects(batch_id),
+        "rail": get_current_rail(),
+    }
 
 
 @post("/api/batches/{batch_id:int}/objects")
 async def api_register(request: Request, batch_id: int) -> Response:
     require_user(request)
     body = await request.json()
-    try:
-        obj = register_object(
-            batch_id,
-            str(body.get("object_key", "")),
-            str(body.get("content_hash", "")),
-            int(body.get("byte_size", 0)),
-        )
-    except ServiceError as exc:
-        return Response(
-            content={"ok": False, "error": exc.message},
-            status_code=exc.status_code,
-            media_type="application/json",
-        )
+    obj = register_object(
+        batch_id,
+        str(body.get("object_key", "")),
+        str(body.get("content_hash", "")),
+        int(body.get("byte_size", 0)),
+    )
     return Response(
         content={"ok": True, "object": obj},
         status_code=200,
@@ -159,19 +185,18 @@ async def api_register(request: Request, batch_id: int) -> Response:
 @post("/api/batches/{batch_id:int}/close")
 async def api_close(request: Request, batch_id: int) -> Response:
     require_user(request)
-    try:
-        run = close_batch(batch_id)
-    except ServiceError as exc:
-        return Response(
-            content={"ok": False, "error": exc.message},
-            status_code=exc.status_code,
-            media_type="application/json",
-        )
+    run = close_batch(batch_id)
     return Response(
         content={"ok": True, "run": run},
         status_code=200,
         media_type="application/json",
     )
+
+
+@get("/api/close-runs")
+async def api_close_runs(request: Request) -> dict:
+    require_user(request)
+    return {"items": list_close_runs(), "rail": get_current_rail()}
 
 
 @get("/api/visibility-reports")
@@ -181,12 +206,12 @@ async def api_reports(request: Request) -> dict:
 
 
 @post("/api/visibility-reports")
-async def api_run_report(request: Request) -> dict:
+async def api_run_report(request: Request) -> Response:
     require_user(request)
     body = await request.json()
     report = run_visibility(str(body.get("as_of_date", "2026-11-16")))
     return Response(
-        content={"ok": True, "report": report},
+        content={"ok": True, "report": report, "rail": get_current_rail()},
         status_code=200,
         media_type="application/json",
     )
@@ -200,13 +225,17 @@ app = Litestar(
         api_login,
         api_logout,
         api_meta,
+        api_rails,
+        api_switch_rail,
         api_batches,
         api_batch_detail,
         api_register,
         api_close,
+        api_close_runs,
         api_reports,
         api_run_report,
         create_static_files_router(path="/static", directories=[str(STATIC)]),
     ],
     on_startup=[_on_startup],
+    exception_handlers={ServiceError: service_error_handler},
 )
